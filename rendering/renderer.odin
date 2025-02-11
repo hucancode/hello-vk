@@ -18,10 +18,8 @@ when ENABLE_VALIDATION_LAYERS {
 SHADER_VERT :: #load("shaders/vert.spv")
 SHADER_FRAG :: #load("shaders/frag.spv")
 MAX_FRAMES_IN_FLIGHT :: 2
-g_ctx: runtime.Context
 
 Renderer :: struct {
-	ctx:                        runtime.Context,
 	instance:                   vk.Instance,
 	window:                     glfw.WindowHandle,
 	dbg_messenger:              vk.DebugUtilsMessengerEXT,
@@ -54,7 +52,7 @@ create_instance :: proc(self: ^Renderer) -> vk.Result {
 	log.info("Creating Vulkan instance...")
 	extensions := slice.clone_to_dynamic(
 		glfw.GetRequiredInstanceExtensions(),
-		g_ctx.temp_allocator,
+		runtime.default_allocator(),
 	)
 	log.info("Required Vulkan extensions:", len(extensions))
 	create_info := vk.InstanceCreateInfo {
@@ -91,7 +89,6 @@ create_instance :: proc(self: ^Renderer) -> vk.Result {
 		if context.logger.lowest_level <= .Debug {
 			severity |= {.VERBOSE}
 		}
-		ctx := self.ctx
 		dbg_create_info := vk.DebugUtilsMessengerCreateInfoEXT {
 			sType = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
 			messageSeverity = severity,
@@ -102,7 +99,7 @@ create_instance :: proc(self: ^Renderer) -> vk.Result {
 				pCallbackData: ^vk.DebugUtilsMessengerCallbackDataEXT,
 				pUserData: rawptr,
 			) -> b32 {
-				context = g_ctx
+				context = runtime.default_context()
 				level: log.Level
 				if .ERROR in severity {
 					level = .Error
@@ -160,7 +157,7 @@ pick_physical_device :: proc(self: ^Renderer) -> vk.Result {
 	) {
 		count: u32
 		vk.EnumerateDeviceExtensionProperties(device, nil, &count, nil) or_return
-		exts = make([]vk.ExtensionProperties, count, g_ctx.temp_allocator)
+		exts = make([]vk.ExtensionProperties, count, context.allocator)
 		vk.EnumerateDeviceExtensionProperties(device, nil, &count, raw_data(exts)) or_return
 		return
 	}
@@ -168,7 +165,7 @@ pick_physical_device :: proc(self: ^Renderer) -> vk.Result {
 		log.infof("vulkan: evaluating device %x", device)
 		props: vk.PhysicalDeviceProperties
 		vk.GetPhysicalDeviceProperties(device, &props)
-		name := strings.truncate_to_byte(string(props.deviceName[:]), 0)
+		name := cstring(raw_data(props.deviceName[:]))
 		log.infof("vulkan: evaluating device %q", name)
 		defer log.infof("vulkan: device %q scored %v", name, score)
 		features: vk.PhysicalDeviceFeatures
@@ -182,25 +179,23 @@ pick_physical_device :: proc(self: ^Renderer) -> vk.Result {
 		}
 		// Need certain extensions supported.
 		{
-			extensions, result := get_available_extensions(device)
-			defer free(raw_data(extensions))
+			exts, result := get_available_extensions(device)
+			defer free(raw_data(exts))
 			if result != .SUCCESS {
 				log.infof("vulkan: enumerate device extension properties failed:", result)
 				return 0
 			}
+			extensions := make(map[cstring]bool)
+			defer delete(extensions)
+			for &e in exts {
+				extensions[cstring(raw_data(e.extensionName[:]))] = true
+			}
 			log.infof("vulkan: device supports %v extensions", len(extensions))
-			required_loop: for required in REQUIRED_EXTENSIONS {
-				log.infof("vulkan: checking for required extension %q", required)
-				for &extension in extensions {
-					extension_name := strings.truncate_to_byte(
-						string(extension.extensionName[:]),
-						0,
-					)
-					if extension_name == string(required) {
-						continue required_loop
-					}
+			for required in REQUIRED_EXTENSIONS {
+				if required in extensions {
+					continue
 				}
-				log.infof("vulkan: device does not support required extension", required)
+				log.infof("vulkan: required extension %q not found", required)
 				return 0
 			}
 			log.info("vulkan: device supports all required extensions")
@@ -211,6 +206,11 @@ pick_physical_device :: proc(self: ^Renderer) -> vk.Result {
 				log.infof("vulkan: query swapchain support failure:", result)
 				return 0
 			}
+			defer {
+				free(raw_data(support.formats))
+				free(raw_data(support.presentModes))
+			}
+
 			// Need at least a format and present mode.
 			if len(support.formats) == 0 || len(support.presentModes) == 0 {
 				log.info("vulkan: device does not support swapchain")
@@ -253,7 +253,8 @@ pick_physical_device :: proc(self: ^Renderer) -> vk.Result {
 	count: u32
 	vk.EnumeratePhysicalDevices(self.instance, &count, nil) or_return
 	log.infof("vulkan: found %v GPUs", count)
-	devices := make([]vk.PhysicalDevice, count, g_ctx.temp_allocator)
+	devices := make([]vk.PhysicalDevice, count, context.allocator)
+	defer delete(devices)
 	vk.EnumeratePhysicalDevices(self.instance, &count, raw_data(devices)) or_return
 	for device in devices {
 		log.infof("vulkan: found device %x", device)
@@ -303,7 +304,7 @@ query_swapchain_support :: proc(
 
 		log.infof("vulkan: found %v surface formats", count)
 
-		support.formats = make([]vk.SurfaceFormatKHR, count, g_ctx.temp_allocator)
+		support.formats = make([]vk.SurfaceFormatKHR, count, context.allocator)
 		vk.GetPhysicalDeviceSurfaceFormatsKHR(
 			device,
 			self.surface,
@@ -316,7 +317,7 @@ query_swapchain_support :: proc(
 		count: u32
 		vk.GetPhysicalDeviceSurfacePresentModesKHR(device, self.surface, &count, nil) or_return
 
-		support.presentModes = make([]vk.PresentModeKHR, count, g_ctx.temp_allocator)
+		support.presentModes = make([]vk.PresentModeKHR, count, context.allocator)
 		vk.GetPhysicalDeviceSurfacePresentModesKHR(
 			device,
 			self.surface,
@@ -340,7 +341,8 @@ find_queue_families :: proc(
 	count: u32
 	vk.GetPhysicalDeviceQueueFamilyProperties(device, &count, nil)
 
-	families := make([]vk.QueueFamilyProperties, count, g_ctx.temp_allocator)
+	families := make([]vk.QueueFamilyProperties, count, context.allocator)
+	defer delete(families)
 	vk.GetPhysicalDeviceQueueFamilyProperties(device, &count, raw_data(families))
 
 	for family, i in families {
@@ -372,13 +374,15 @@ create_logical_device :: proc(self: ^Renderer) -> vk.Result {
 	indices_set := make(map[u32]struct {})
 	indices_set[families.graphics.?] = {}
 	indices_set[families.present.?] = {}
+	defer delete(indices_set)
 
 	queue_create_infos := make(
 		[dynamic]vk.DeviceQueueCreateInfo,
 		0,
 		len(indices_set),
-		g_ctx.temp_allocator,
+		context.allocator,
 	)
+	defer delete(queue_create_infos)
 	for _ in indices_set {
 		append(
 			&queue_create_infos,
@@ -457,6 +461,10 @@ create_swapchain :: proc(self: ^Renderer) -> (result: vk.Result) {
 	// Setup swapchain.
 	{
 		support := query_swapchain_support(self, self.physical_device) or_return
+		defer {
+			free(raw_data(support.formats))
+			free(raw_data(support.presentModes))
+		}
 		surface_format := pick_swapchain_surface_format(support.formats)
 		present_mode := pick_swapchain_present_mode(support.presentModes)
 		extent := pick_swapchain_extent(self.window, support.capabilities)
@@ -505,7 +513,7 @@ create_swapchain :: proc(self: ^Renderer) -> (result: vk.Result) {
 	{
 		count: u32
 		vk.GetSwapchainImagesKHR(self.device, self.swapchain, &count, nil) or_return
-
+		log.infof("vulkan: found %v swapchain images", count)
 		self.swapchain_images = make([]vk.Image, count)
 		self.swapchain_views = make([]vk.ImageView, count)
 		vk.GetSwapchainImagesKHR(
@@ -524,6 +532,7 @@ create_swapchain :: proc(self: ^Renderer) -> (result: vk.Result) {
 				subresourceRange = {aspectMask = {.COLOR}, levelCount = 1, layerCount = 1},
 			}
 			vk.CreateImageView(self.device, &create_info, nil, &self.swapchain_views[i]) or_return
+			log.infof("vulkan: created image view %v", i)
 		}
 	}
 	return .SUCCESS
@@ -789,7 +798,6 @@ detroy_semaphores :: proc(self: ^Renderer) {
 }
 
 render :: proc(self: ^Renderer) -> vk.Result {
-	free_all(g_ctx.temp_allocator)
 	// Wait for previous frame.
 	vk.WaitForFences(
 		self.device,
@@ -904,8 +912,6 @@ recreate_swapchain :: proc(self: ^Renderer) {
 }
 
 init :: proc(self: ^Renderer, window: glfw.WindowHandle) -> vk.Result {
-	g_ctx = context
-	self.ctx = context
 	self.window = window
 	vk.load_proc_addresses_global(rawptr(glfw.GetInstanceProcAddress))
 	create_instance(self) or_return
@@ -915,6 +921,7 @@ init :: proc(self: ^Renderer, window: glfw.WindowHandle) -> vk.Result {
 	create_swapchain(self) or_return
 	load_shader(self) or_return
 	create_render_pass(self) or_return
+	create_framebuffers(self) or_return
 	create_pipeline(self) or_return
 	create_command_pool(self) or_return
 	create_semaphores(self) or_return
