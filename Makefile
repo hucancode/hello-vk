@@ -1,7 +1,7 @@
-release: main.odin shader
+release: shader
 	odin run . -out:bin/hello-vk
-debug: main.odin shader
+debug: shader
 	odin run . -out:bin/hello-vk -debug
-shader: shaders/shader.vert shaders/shader.frag
-	glslc shaders/shader.vert -o shaders/vert.spv
-	glslc shaders/shader.frag -o shaders/frag.spv
+shader: rendering/shaders/shader.vert rendering/shaders/shader.frag
+	glslc rendering/shaders/shader.vert -o rendering/shaders/vert.spv
+	glslc rendering/shaders/shader.frag -o rendering/shaders/frag.spv
