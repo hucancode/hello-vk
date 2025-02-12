@@ -1,8 +1,7 @@
 package world
 
 World :: struct {
-	cameras: Camera,
-	root:    Node,
-	lights:  []Light,
-	time:    f32,
+	camera: Camera,
+	root:   Node,
+	time:   f32,
 }

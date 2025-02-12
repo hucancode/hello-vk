@@ -1,3 +1,12 @@
 package world
+import g "../geometry"
 
-Node :: struct {}
+NodeVariant :: union {
+	g.Mesh,
+	Light,
+}
+Node :: struct {
+	position: [3]f32,
+	children: []Node,
+	variant:  NodeVariant,
+}

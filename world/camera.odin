@@ -1,3 +1,8 @@
 package world
 
-Camera :: struct {}
+Camera :: struct {
+	fov:    f32,
+	aspect: f32,
+	near:   f32,
+	far:    f32,
+}

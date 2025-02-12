@@ -1,3 +1,6 @@
 package world
 
-Light :: struct {}
+Light :: struct {
+	color:     [3]f32,
+	intensity: f32,
+}
