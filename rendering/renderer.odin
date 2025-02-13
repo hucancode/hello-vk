@@ -897,10 +897,14 @@ record_command_buffer :: proc(self: ^Renderer, image_index: u32) -> vk.Result {
 		extent = self.swapchain_extent,
 	}
 	vk.CmdSetScissor(command_buffer, 0, 1, &scissor)
-	vk.CmdDraw(command_buffer, 6, 1, 0, 0)
+	draw(command_buffer)
 	vk.CmdEndRenderPass(command_buffer)
 	vk.EndCommandBuffer(command_buffer) or_return
 	return .SUCCESS
+}
+
+draw :: proc(command_buffer: vk.CommandBuffer) {
+	vk.CmdDraw(command_buffer, 6, 1, 0, 0)
 }
 
 recreate_swapchain :: proc(self: ^Renderer) {
