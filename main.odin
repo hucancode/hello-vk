@@ -43,10 +43,7 @@ run :: proc() -> vk.Result {
 	defer rendering.destroy(&renderer)
 	for !glfw.WindowShouldClose(window) {
 		glfw.PollEvents()
-		ret := rendering.render(&renderer)
-		if ret != .SUCCESS {
-			log.warnf("vulkan: render failure: %v", ret)
-		}
+		rendering.render(&renderer) or_continue
 	}
 	return .SUCCESS
 }

@@ -1,6 +1,9 @@
 package rendering
+import "../geometry"
+import "base:intrinsics"
 import "base:runtime"
 import "core:log"
+import "core:math/linalg"
 import "core:slice"
 import "core:strings"
 import "vendor:glfw"
@@ -18,6 +21,13 @@ when ENABLE_VALIDATION_LAYERS {
 SHADER_VERT :: #load("shaders/vert.spv")
 SHADER_FRAG :: #load("shaders/frag.spv")
 MAX_FRAMES_IN_FLIGHT :: 2
+vertices := []geometry.Vertex {
+	{position = {-0.5, -0.5, 0.0, 1.0}, color = {0.5, 0.3, 0.0, 1.0}},
+	{position = {0.5, -0.5, 0.0, 1.0}, color = {0.2, 0.5, 0.0, 1.0}},
+	{position = {0.5, 0.5, 0.0, 1.0}, color = {0.5, 0.7, 0.0, 1.0}},
+	{position = {-0.5, 0.5, 0.0, 1.0}, color = {0.7, 0.5, 0.0, 1.0}},
+}
+indices := []u16{0, 1, 2, 2, 3, 0}
 
 Renderer :: struct {
 	instance:                   vk.Instance,
@@ -34,18 +44,32 @@ Renderer :: struct {
 	swapchain_format:           vk.SurfaceFormatKHR,
 	swapchain_extent:           vk.Extent2D,
 	swapchain_frame_buffers:    []vk.Framebuffer,
-	vert_shader_module:         vk.ShaderModule,
-	frag_shader_module:         vk.ShaderModule,
-	shader_stages:              [2]vk.PipelineShaderStageCreateInfo,
 	render_pass:                vk.RenderPass,
+	descriptor_set_layout:      vk.DescriptorSetLayout,
 	pipeline_layout:            vk.PipelineLayout,
 	pipeline:                   vk.Pipeline,
+	descriptor_pool:            vk.DescriptorPool,
+	descriptor_sets:            [MAX_FRAMES_IN_FLIGHT]vk.DescriptorSet,
 	command_pool:               vk.CommandPool,
 	command_buffers:            [MAX_FRAMES_IN_FLIGHT]vk.CommandBuffer,
 	image_available_semaphores: [MAX_FRAMES_IN_FLIGHT]vk.Semaphore,
 	render_finished_semaphores: [MAX_FRAMES_IN_FLIGHT]vk.Semaphore,
 	in_flight_fences:           [MAX_FRAMES_IN_FLIGHT]vk.Fence,
+	uniform_buffers:            [MAX_FRAMES_IN_FLIGHT]vk.Buffer,
+	uniform_buffer_memories:    [MAX_FRAMES_IN_FLIGHT]vk.DeviceMemory,
+	uniform_buffer_mapped:      [MAX_FRAMES_IN_FLIGHT]rawptr,
+	index_buffer:               vk.Buffer,
+	index_buffer_memory:        vk.DeviceMemory,
+	vertex_buffer:              vk.Buffer,
+	vertex_buffer_memory:       vk.DeviceMemory,
 	current_frame:              u32,
+}
+
+UniformBuffer :: struct #align (16) {
+	model:      matrix[4, 4]f32,
+	view:       matrix[4, 4]f32,
+	projection: matrix[4, 4]f32,
+	time:       f32,
 }
 
 create_instance :: proc(self: ^Renderer) -> vk.Result {
@@ -563,30 +587,6 @@ create_shader_module :: proc(
 	return
 }
 
-load_shader :: proc(self: ^Renderer) -> vk.Result {
-	self.vert_shader_module = create_shader_module(self, SHADER_VERT) or_return
-	self.shader_stages[0] = vk.PipelineShaderStageCreateInfo {
-		sType  = .PIPELINE_SHADER_STAGE_CREATE_INFO,
-		stage  = {.VERTEX},
-		module = self.vert_shader_module,
-		pName  = "main",
-	}
-
-	self.frag_shader_module = create_shader_module(self, SHADER_FRAG) or_return
-	self.shader_stages[1] = vk.PipelineShaderStageCreateInfo {
-		sType  = .PIPELINE_SHADER_STAGE_CREATE_INFO,
-		stage  = {.FRAGMENT},
-		module = self.frag_shader_module,
-		pName  = "main",
-	}
-	return .SUCCESS
-}
-
-destroy_shader :: proc(self: ^Renderer) {
-	vk.DestroyShaderModule(self.device, self.vert_shader_module, nil)
-	vk.DestroyShaderModule(self.device, self.frag_shader_module, nil)
-}
-
 create_render_pass :: proc(self: ^Renderer) -> vk.Result {
 	color_attachment := vk.AttachmentDescription {
 		format         = self.swapchain_format.format,
@@ -662,18 +662,67 @@ destroy_framebuffers :: proc(self: ^Renderer) {
 	delete(self.swapchain_frame_buffers)
 }
 
+create_descriptor_set_layout :: proc(self: ^Renderer) -> vk.Result {
+	descriptor_set_layout_info := vk.DescriptorSetLayoutCreateInfo {
+		sType        = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		bindingCount = 1,
+		pBindings    = &vk.DescriptorSetLayoutBinding {
+			binding = 0,
+			descriptorType = .UNIFORM_BUFFER,
+			descriptorCount = 1,
+			stageFlags = vk.ShaderStageFlags{.VERTEX},
+		},
+	}
+	return vk.CreateDescriptorSetLayout(
+		self.device,
+		&descriptor_set_layout_info,
+		nil,
+		&self.descriptor_set_layout,
+	)
+}
 create_pipeline :: proc(self: ^Renderer) -> vk.Result {
+	vert_shader_module := create_shader_module(self, SHADER_VERT) or_return
+	defer vk.DestroyShaderModule(self.device, vert_shader_module, nil)
+	frag_shader_module := create_shader_module(self, SHADER_FRAG) or_return
+	defer vk.DestroyShaderModule(self.device, frag_shader_module, nil)
+	shader_stages := []vk.PipelineShaderStageCreateInfo {
+		{
+			sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+			stage = {.VERTEX},
+			module = vert_shader_module,
+			pName = "main",
+		},
+		{
+			sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+			stage = {.FRAGMENT},
+			module = frag_shader_module,
+			pName = "main",
+		},
+	}
 	dynamic_states := []vk.DynamicState{.VIEWPORT, .SCISSOR}
 	dynamic_state := vk.PipelineDynamicStateCreateInfo {
 		sType             = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-		dynamicStateCount = 2,
+		dynamicStateCount = u32(len(dynamic_states)),
 		pDynamicStates    = raw_data(dynamic_states),
 	}
-
-	vertex_input_info := vk.PipelineVertexInputStateCreateInfo {
-		sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+	v_binding_description := vk.VertexInputBindingDescription {
+		binding   = 0,
+		stride    = size_of(geometry.Vertex),
+		inputRate = .VERTEX,
 	}
-
+	v_pos_attribute_description := []vk.VertexInputAttributeDescription {
+		{binding = 0, location = 0, format = .R32G32B32A32_SFLOAT, offset = size_of([4]f32) * 0},
+		{binding = 0, location = 1, format = .R32G32B32A32_SFLOAT, offset = size_of([4]f32) * 1},
+		{binding = 0, location = 2, format = .R32G32B32A32_SFLOAT, offset = size_of([4]f32) * 2},
+		{binding = 0, location = 3, format = .R32G32_SFLOAT, offset = size_of([4]f32) * 3},
+	}
+	vertex_input_info := vk.PipelineVertexInputStateCreateInfo {
+		sType                           = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+		vertexBindingDescriptionCount   = 1,
+		pVertexBindingDescriptions      = &v_binding_description,
+		vertexAttributeDescriptionCount = u32(len(v_pos_attribute_description)),
+		pVertexAttributeDescriptions    = raw_data(v_pos_attribute_description),
+	}
 	input_assembly := vk.PipelineInputAssemblyStateCreateInfo {
 		sType    = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
 		topology = .TRIANGLE_LIST,
@@ -710,14 +759,16 @@ create_pipeline :: proc(self: ^Renderer) -> vk.Result {
 	}
 
 	pipeline_layout := vk.PipelineLayoutCreateInfo {
-		sType = .PIPELINE_LAYOUT_CREATE_INFO,
+		sType          = .PIPELINE_LAYOUT_CREATE_INFO,
+		setLayoutCount = 1,
+		pSetLayouts    = &self.descriptor_set_layout,
 	}
 	vk.CreatePipelineLayout(self.device, &pipeline_layout, nil, &self.pipeline_layout) or_return
-
-	pipeline := vk.GraphicsPipelineCreateInfo {
+	log.info("vulkan: created pipeline layout")
+	pipeline_info := vk.GraphicsPipelineCreateInfo {
 		sType               = .GRAPHICS_PIPELINE_CREATE_INFO,
-		stageCount          = 2,
-		pStages             = &self.shader_stages[0],
+		stageCount          = u32(len(shader_stages)),
+		pStages             = raw_data(shader_stages),
 		pVertexInputState   = &vertex_input_info,
 		pInputAssemblyState = &input_assembly,
 		pViewportState      = &viewport_state,
@@ -730,10 +781,12 @@ create_pipeline :: proc(self: ^Renderer) -> vk.Result {
 		subpass             = 0,
 		basePipelineIndex   = -1,
 	}
-	return vk.CreateGraphicsPipelines(self.device, 0, 1, &pipeline, nil, &self.pipeline)
+	vk.CreateGraphicsPipelines(self.device, 0, 1, &pipeline_info, nil, &self.pipeline) or_return
+	return .SUCCESS
 }
 
 destroy_pipeline :: proc(self: ^Renderer) {
+	vk.DestroyDescriptorSetLayout(self.device, self.descriptor_set_layout, nil)
 	vk.DestroyPipelineLayout(self.device, self.pipeline_layout, nil)
 	vk.DestroyPipeline(self.device, self.pipeline, nil)
 }
@@ -752,7 +805,7 @@ create_command_pool :: proc(self: ^Renderer) -> vk.Result {
 		level              = .PRIMARY,
 		commandBufferCount = MAX_FRAMES_IN_FLIGHT,
 	}
-	return vk.AllocateCommandBuffers(self.device, &alloc_info, &self.command_buffers[0])
+	return vk.AllocateCommandBuffers(self.device, &alloc_info, raw_data(&self.command_buffers))
 }
 
 destroy_command_pool :: proc(self: ^Renderer) {
@@ -796,6 +849,226 @@ detroy_semaphores :: proc(self: ^Renderer) {
 		vk.DestroyFence(self.device, fence, nil)
 	}
 }
+create_buffer :: proc(
+	self: ^Renderer,
+	size: vk.DeviceSize,
+	usage: vk.BufferUsageFlags,
+	properties: vk.MemoryPropertyFlags,
+) -> (
+	buffer: vk.Buffer,
+	memory: vk.DeviceMemory,
+	ret: vk.Result,
+) {
+	find_memory_type :: proc(
+		device: vk.PhysicalDevice,
+		typeFilter: u32,
+		properties: vk.MemoryPropertyFlags,
+	) -> u32 {
+		props: vk.PhysicalDeviceMemoryProperties
+		vk.GetPhysicalDeviceMemoryProperties(device, &props)
+		for i in 0 ..< props.memoryTypeCount {
+			if (typeFilter & (1 << i) == 0) {
+				continue
+			}
+			if ((props.memoryTypes[i].propertyFlags & properties) < properties) {
+				continue
+			}
+			return i
+		}
+		return 0
+	}
+
+	create_info := vk.BufferCreateInfo {
+		sType       = .BUFFER_CREATE_INFO,
+		size        = size,
+		usage       = usage,
+		sharingMode = .EXCLUSIVE,
+	}
+	vk.CreateBuffer(self.device, &create_info, nil, &buffer) or_return
+	req: vk.MemoryRequirements
+	vk.GetBufferMemoryRequirements(self.device, buffer, &req)
+	alloc_info := vk.MemoryAllocateInfo {
+		sType           = .MEMORY_ALLOCATE_INFO,
+		allocationSize  = req.size,
+		memoryTypeIndex = find_memory_type(self.physical_device, req.memoryTypeBits, properties),
+	}
+	vk.AllocateMemory(self.device, &alloc_info, nil, &memory) or_return
+	vk.BindBufferMemory(self.device, buffer, memory, 0)
+	return
+}
+
+copy_buffer :: proc(self: ^Renderer, dst, src: vk.Buffer, size: vk.DeviceSize) {
+	command_buffer: vk.CommandBuffer
+	vk.AllocateCommandBuffers(
+		self.device,
+		&vk.CommandBufferAllocateInfo {
+			sType = .COMMAND_BUFFER_ALLOCATE_INFO,
+			level = .PRIMARY,
+			commandPool = self.command_pool,
+			commandBufferCount = 1,
+		},
+		&command_buffer,
+	)
+	defer vk.FreeCommandBuffers(self.device, self.command_pool, 1, &command_buffer)
+	vk.BeginCommandBuffer(
+		command_buffer,
+		&vk.CommandBufferBeginInfo {
+			sType = .COMMAND_BUFFER_BEGIN_INFO,
+			flags = vk.CommandBufferUsageFlags{.ONE_TIME_SUBMIT},
+		},
+	)
+	vk.CmdCopyBuffer(command_buffer, src, dst, 1, &vk.BufferCopy{size = size})
+	vk.EndCommandBuffer(command_buffer)
+	vk.QueueSubmit(
+		self.graphics_queue,
+		1,
+		&vk.SubmitInfo {
+			sType = .SUBMIT_INFO,
+			commandBufferCount = 1,
+			pCommandBuffers = &command_buffer,
+		},
+		vk.Fence(0),
+	)
+	vk.QueueWaitIdle(self.graphics_queue)
+}
+create_buffer_init :: proc(
+	self: ^Renderer,
+	data: rawptr,
+	size: vk.DeviceSize,
+	usage: vk.BufferUsageFlags,
+	properties: vk.MemoryPropertyFlags,
+) -> (
+	buffer: vk.Buffer,
+	memory: vk.DeviceMemory,
+	ret: vk.Result,
+) {
+	stg_buffer, stg_memory := create_buffer(
+		self,
+		size,
+		vk.BufferUsageFlags{.TRANSFER_SRC},
+		vk.MemoryPropertyFlags{.HOST_VISIBLE, .HOST_COHERENT},
+	) or_return
+	defer {
+		vk.DestroyBuffer(self.device, stg_buffer, nil)
+		vk.FreeMemory(self.device, stg_memory, nil)
+	}
+	stg_data: rawptr
+	vk.MapMemory(self.device, stg_memory, 0, size, vk.MemoryMapFlags{}, &stg_data)
+	defer vk.UnmapMemory(self.device, stg_memory)
+	runtime.mem_copy(stg_data, data, int(size))
+	buffer, memory = create_buffer(
+		self,
+		size,
+		vk.BufferUsageFlags{.TRANSFER_DST} | usage,
+		properties,
+	) or_return
+	copy_buffer(self, buffer, stg_buffer, size)
+	return
+}
+
+create_buffers :: proc(self: ^Renderer) -> vk.Result {
+	self.vertex_buffer, self.vertex_buffer_memory = create_buffer_init(
+		self,
+		raw_data(vertices),
+		vk.DeviceSize(size_of(vertices[0]) * len(vertices)),
+		vk.BufferUsageFlags{.VERTEX_BUFFER},
+		vk.MemoryPropertyFlags{.DEVICE_LOCAL},
+	) or_return
+	self.index_buffer, self.index_buffer_memory = create_buffer_init(
+		self,
+		raw_data(indices),
+		vk.DeviceSize(size_of(indices[0]) * len(indices)),
+		vk.BufferUsageFlags{.INDEX_BUFFER},
+		vk.MemoryPropertyFlags{.DEVICE_LOCAL},
+	) or_return
+	for i in 0 ..< MAX_FRAMES_IN_FLIGHT {
+		self.uniform_buffers[i], self.uniform_buffer_memories[i] = create_buffer(
+			self,
+			size_of(UniformBuffer),
+			vk.BufferUsageFlags{.UNIFORM_BUFFER},
+			vk.MemoryPropertyFlags{.HOST_VISIBLE, .HOST_COHERENT},
+		) or_return
+		vk.MapMemory(
+			self.device,
+			self.uniform_buffer_memories[i],
+			0,
+			size_of(UniformBuffer),
+			vk.MemoryMapFlags{},
+			&self.uniform_buffer_mapped[i],
+		)
+	}
+	return .SUCCESS
+}
+
+destroy_buffers :: proc(self: ^Renderer) {
+	vk.DestroyBuffer(self.device, self.vertex_buffer, nil)
+	vk.FreeMemory(self.device, self.vertex_buffer_memory, nil)
+	vk.DestroyBuffer(self.device, self.index_buffer, nil)
+	vk.FreeMemory(self.device, self.index_buffer_memory, nil)
+	for i in 0 ..< MAX_FRAMES_IN_FLIGHT {
+		vk.DestroyBuffer(self.device, self.uniform_buffers[i], nil)
+		vk.FreeMemory(self.device, self.uniform_buffer_memories[i], nil)
+	}
+}
+
+update_uniforms :: proc(self: ^Renderer) {
+	width, height := glfw.GetFramebufferSize(self.window)
+	ubo := UniformBuffer {
+		model      = linalg.MATRIX4F32_IDENTITY,
+		view       = linalg.matrix4_look_at_f32({0, 2.0, 2.0}, {}, linalg.VECTOR3F32_Y_AXIS),
+		projection = linalg.matrix4_perspective_f32(
+			linalg.PI * 0.25,
+			f32(width) / f32(height),
+			0.1,
+			10.0,
+		),
+		time       = 0.0,
+	}
+	runtime.mem_copy(self.uniform_buffer_mapped[self.current_frame], &ubo, size_of(ubo))
+}
+
+create_descriptor_sets :: proc(self: ^Renderer) -> vk.Result {
+	create_info := vk.DescriptorPoolCreateInfo {
+		sType         = .DESCRIPTOR_POOL_CREATE_INFO,
+		poolSizeCount = 1,
+		pPoolSizes    = &vk.DescriptorPoolSize {
+			type = .UNIFORM_BUFFER,
+			descriptorCount = MAX_FRAMES_IN_FLIGHT,
+		},
+		maxSets       = MAX_FRAMES_IN_FLIGHT,
+	}
+	vk.CreateDescriptorPool(self.device, &create_info, nil, &self.descriptor_pool) or_return
+	set_layouts := make([]vk.DescriptorSetLayout, MAX_FRAMES_IN_FLIGHT)
+	slice.fill(set_layouts, self.descriptor_set_layout)
+	alloc_info := vk.DescriptorSetAllocateInfo {
+		sType              = .DESCRIPTOR_SET_ALLOCATE_INFO,
+		descriptorPool     = self.descriptor_pool,
+		descriptorSetCount = u32(len(set_layouts)),
+		pSetLayouts        = raw_data(set_layouts),
+	}
+	vk.AllocateDescriptorSets(self.device, &alloc_info, raw_data(&self.descriptor_sets)) or_return
+	for i in 0 ..< MAX_FRAMES_IN_FLIGHT {
+		descriptor_write := vk.WriteDescriptorSet {
+			sType           = .WRITE_DESCRIPTOR_SET,
+			dstSet          = self.descriptor_sets[i],
+			dstBinding      = 0,
+			descriptorType  = .UNIFORM_BUFFER,
+			descriptorCount = 1,
+			pBufferInfo     = &vk.DescriptorBufferInfo {
+				buffer = self.uniform_buffers[i],
+				offset = 0,
+				range = size_of(UniformBuffer),
+			},
+		}
+		vk.UpdateDescriptorSets(self.device, 1, &descriptor_write, 0, nil)
+	}
+	return .SUCCESS
+}
+
+destroy_descriptor_sets :: proc(self: ^Renderer) {
+	vk.DestroyDescriptorPool(self.device, self.descriptor_pool, nil)
+	vk.DestroyDescriptorSetLayout(self.device, self.descriptor_set_layout, nil)
+}
 
 render :: proc(self: ^Renderer) -> vk.Result {
 	// Wait for previous frame.
@@ -825,6 +1098,7 @@ render :: proc(self: ^Renderer) -> vk.Result {
 	case:
 		log.panicf("vulkan: acquire next image failure: %v", acquire_result)
 	}
+	update_uniforms(self)
 	vk.ResetFences(self.device, 1, &self.in_flight_fences[self.current_frame]) or_return
 	vk.ResetCommandBuffer(self.command_buffers[self.current_frame], {}) or_return
 	record_command_buffer(self, image_index) or_return
@@ -891,20 +1165,38 @@ record_command_buffer :: proc(self: ^Renderer, image_index: u32) -> vk.Result {
 		width    = f32(self.swapchain_extent.width),
 		height   = f32(self.swapchain_extent.height),
 		maxDepth = 1.0,
+		minDepth = 0.0,
 	}
 	vk.CmdSetViewport(command_buffer, 0, 1, &viewport)
-	scissor := vk.Rect2D {
-		extent = self.swapchain_extent,
-	}
-	vk.CmdSetScissor(command_buffer, 0, 1, &scissor)
-	draw(command_buffer)
+	vk.CmdSetScissor(command_buffer, 0, 1, &vk.Rect2D{extent = self.swapchain_extent})
+	draw(self, command_buffer)
 	vk.CmdEndRenderPass(command_buffer)
 	vk.EndCommandBuffer(command_buffer) or_return
 	return .SUCCESS
 }
 
-draw :: proc(command_buffer: vk.CommandBuffer) {
-	vk.CmdDraw(command_buffer, 6, 1, 0, 0)
+draw :: proc(self: ^Renderer, command_buffer: vk.CommandBuffer) {
+	buffers := []vk.Buffer{self.vertex_buffer}
+	offsets := []vk.DeviceSize{0}
+	vk.CmdBindVertexBuffers(
+		command_buffer,
+		0,
+		u32(len(buffers)),
+		raw_data(buffers),
+		raw_data(offsets),
+	)
+	vk.CmdBindIndexBuffer(command_buffer, self.index_buffer, 0, .UINT16)
+	vk.CmdBindDescriptorSets(
+		command_buffer,
+		.GRAPHICS,
+		self.pipeline_layout,
+		0,
+		1,
+		&self.descriptor_sets[self.current_frame],
+		0,
+		nil,
+	)
+	vk.CmdDrawIndexed(command_buffer, u32(len(indices)), 1, 0, 0, 0)
 }
 
 recreate_swapchain :: proc(self: ^Renderer) {
@@ -923,11 +1215,13 @@ init :: proc(self: ^Renderer, window: glfw.WindowHandle) -> vk.Result {
 	pick_physical_device(self) or_return
 	create_logical_device(self) or_return
 	create_swapchain(self) or_return
-	load_shader(self) or_return
 	create_render_pass(self) or_return
+	create_descriptor_set_layout(self) or_return
 	create_framebuffers(self) or_return
 	create_pipeline(self) or_return
 	create_command_pool(self) or_return
+	create_buffers(self) or_return
+	create_descriptor_sets(self) or_return
 	create_semaphores(self) or_return
 	return .SUCCESS
 }
@@ -935,10 +1229,11 @@ init :: proc(self: ^Renderer, window: glfw.WindowHandle) -> vk.Result {
 destroy :: proc(self: ^Renderer) {
 	vk.DeviceWaitIdle(self.device)
 	detroy_semaphores(self)
+	destroy_descriptor_sets(self)
+	destroy_buffers(self)
 	destroy_command_pool(self)
 	destroy_pipeline(self)
 	destroy_render_pass(self)
-	destroy_shader(self)
 	destroy_framebuffers(self)
 	destroy_swapchain(self)
 	destroy_device(self)
