@@ -43,6 +43,7 @@ run :: proc() -> vk.Result {
 	defer rendering.destroy(&renderer)
 	for !glfw.WindowShouldClose(window) {
 		glfw.PollEvents()
+		rendering.update(&renderer)
 		rendering.render(&renderer) or_continue
 	}
 	return .SUCCESS

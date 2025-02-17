@@ -6,6 +6,7 @@ import "core:log"
 import "core:math/linalg"
 import "core:slice"
 import "core:strings"
+import "core:time"
 import "vendor:glfw"
 import vk "vendor:vulkan"
 
@@ -22,12 +23,81 @@ SHADER_VERT :: #load("shaders/vert.spv")
 SHADER_FRAG :: #load("shaders/frag.spv")
 MAX_FRAMES_IN_FLIGHT :: 2
 vertices := []geometry.Vertex {
-	{position = {-0.5, -0.5, 0.0, 1.0}, color = {0.5, 0.3, 0.0, 1.0}},
-	{position = {0.5, -0.5, 0.0, 1.0}, color = {0.2, 0.5, 0.0, 1.0}},
-	{position = {0.5, 0.5, 0.0, 1.0}, color = {0.5, 0.7, 0.0, 1.0}},
-	{position = {-0.5, 0.5, 0.0, 1.0}, color = {0.7, 0.5, 0.0, 1.0}},
+	// top (0, 0, 1)
+	{position = {-1.0, -1.0, 1.0, 1.0}, color = {0.0, 0.0, 1.0, 1.0}},
+	{position = {1.0, -1.0, 1.0, 1.0}, color = {0.0, 0.0, 1.0, 1.0}},
+	{position = {1.0, 1.0, 1.0, 1.0}, color = {0.0, 0.0, 1.0, 1.0}},
+	{position = {-1.0, 1.0, 1.0, 1.0}, color = {0.0, 0.0, 1.0, 1.0}},
+
+	// bottom (0, 0, -1)
+	{position = {-1.0, 1.0, -1.0, 1.0}, color = {0.0, 0.3, 1.0, 1.0}},
+	{position = {1.0, 1.0, -1.0, 1.0}, color = {0.0, 0.3, 1.0, 1.0}},
+	{position = {1.0, -1.0, -1.0, 1.0}, color = {0.0, 0.3, 1.0, 1.0}},
+	{position = {-1.0, -1.0, -1.0, 1.0}, color = {0.0, 0.3, 1.0, 1.0}},
+
+	// right (1, 0, 0)
+	{position = {1.0, -1.0, -1.0, 1.0}, color = {1.0, 0.0, 0.0, 1.0}},
+	{position = {1.0, 1.0, -1.0, 1.0}, color = {1.0, 0.0, 0.0, 1.0}},
+	{position = {1.0, 1.0, 1.0, 1.0}, color = {1.0, 0.0, 0.0, 1.0}},
+	{position = {1.0, -1.0, 1.0, 1.0}, color = {1.0, 0.0, 0.0, 1.0}},
+
+	// left (-1, 0, 0)
+	{position = {-1.0, -1.0, 1.0, 1.0}, color = {1.0, 0.5, 0.0, 1.0}},
+	{position = {-1.0, 1.0, 1.0, 1.0}, color = {1.0, 0.5, 0.0, 1.0}},
+	{position = {-1.0, 1.0, -1.0, 1.0}, color = {1.0, 0.5, 0.0, 1.0}},
+	{position = {-1.0, -1.0, -1.0, 1.0}, color = {1.0, 0.5, 0.0, 1.0}},
+
+	// front (0, 1, 0)
+	{position = {1.0, 1.0, -1.0, 1.0}, color = {0.0, 1.0, 0.0, 1.0}},
+	{position = {-1.0, 1.0, -1.0, 1.0}, color = {0.0, 1.0, 0.0, 1.0}},
+	{position = {-1.0, 1.0, 1.0, 1.0}, color = {0.0, 1.0, 0.0, 1.0}},
+	{position = {1.0, 1.0, 1.0, 1.0}, color = {0.0, 1.0, 0.0, 1.0}},
+
+	// back (0, -1, 0)
+	{position = {1.0, -1.0, 1.0, 1.0}, color = {0.6, 1.0, 0.0, 1.0}},
+	{position = {-1.0, -1.0, 1.0, 1.0}, color = {0.6, 1.0, 0.0, 1.0}},
+	{position = {-1.0, -1.0, -1.0, 1.0}, color = {0.6, 1.0, 0.0, 1.0}},
+	{position = {1.0, -1.0, -1.0, 1.0}, color = {0.6, 1.0, 0.0, 1.0}},
 }
-indices := []u16{0, 1, 2, 2, 3, 0}
+
+indices := []u16 {
+	0,
+	1,
+	2,
+	2,
+	3,
+	0, // top
+	4,
+	5,
+	6,
+	6,
+	7,
+	4, // bottom
+	8,
+	9,
+	10,
+	10,
+	11,
+	8, // right
+	12,
+	13,
+	14,
+	14,
+	15,
+	12, // left
+	16,
+	17,
+	18,
+	18,
+	19,
+	16, // front
+	20,
+	21,
+	22,
+	22,
+	23,
+	20, // back
+}
 
 Renderer :: struct {
 	instance:                   vk.Instance,
@@ -63,6 +133,9 @@ Renderer :: struct {
 	vertex_buffer:              vk.Buffer,
 	vertex_buffer_memory:       vk.DeviceMemory,
 	current_frame:              u32,
+	last_frame_timestamp:       time.Time,
+	start_timestamp:            time.Time,
+	ubo:                        UniformBuffer,
 }
 
 UniformBuffer :: struct #align (16) {
@@ -1011,20 +1084,27 @@ destroy_buffers :: proc(self: ^Renderer) {
 	}
 }
 
-update_uniforms :: proc(self: ^Renderer) {
+create_ubo :: proc(self: ^Renderer) {
 	width, height := glfw.GetFramebufferSize(self.window)
-	ubo := UniformBuffer {
+	self.ubo = UniformBuffer {
 		model      = linalg.MATRIX4F32_IDENTITY,
-		view       = linalg.matrix4_look_at_f32({0, 2.0, 2.0}, {}, linalg.VECTOR3F32_Y_AXIS),
+		view       = linalg.matrix4_look_at_f32({0.0, 5.0, 5.0}, {}, linalg.VECTOR3F32_Y_AXIS),
 		projection = linalg.matrix4_perspective_f32(
 			linalg.PI * 0.25,
 			f32(width) / f32(height),
 			0.1,
-			10.0,
+			10000.0,
 		),
 		time       = 0.0,
 	}
-	runtime.mem_copy(self.uniform_buffer_mapped[self.current_frame], &ubo, size_of(ubo))
+}
+
+update_uniforms :: proc(self: ^Renderer) {
+	runtime.mem_copy(
+		self.uniform_buffer_mapped[self.current_frame],
+		&self.ubo,
+		size_of(UniformBuffer),
+	)
 }
 
 create_descriptor_sets :: proc(self: ^Renderer) -> vk.Result {
@@ -1199,6 +1279,15 @@ draw :: proc(self: ^Renderer, command_buffer: vk.CommandBuffer) {
 	vk.CmdDrawIndexed(command_buffer, u32(len(indices)), 1, 0, 0, 0)
 }
 
+update :: proc(self: ^Renderer) {
+	self.ubo.time = f32(time.duration_milliseconds(time.since(self.start_timestamp)))
+	self.ubo.model = linalg.matrix4_rotate_f32(
+		self.ubo.time * 0.001 * linalg.PI / 2,
+		linalg.VECTOR3F32_Z_AXIS,
+	)
+	self.last_frame_timestamp = time.now()
+}
+
 recreate_swapchain :: proc(self: ^Renderer) {
 	vk.DeviceWaitIdle(self.device)
 	destroy_framebuffers(self)
@@ -1208,6 +1297,8 @@ recreate_swapchain :: proc(self: ^Renderer) {
 }
 
 init :: proc(self: ^Renderer, window: glfw.WindowHandle) -> vk.Result {
+	self.start_timestamp = time.now()
+	self.last_frame_timestamp = self.start_timestamp
 	self.window = window
 	vk.load_proc_addresses_global(rawptr(glfw.GetInstanceProcAddress))
 	create_instance(self) or_return
@@ -1223,6 +1314,7 @@ init :: proc(self: ^Renderer, window: glfw.WindowHandle) -> vk.Result {
 	create_buffers(self) or_return
 	create_descriptor_sets(self) or_return
 	create_semaphores(self) or_return
+	create_ubo(self)
 	return .SUCCESS
 }
 
